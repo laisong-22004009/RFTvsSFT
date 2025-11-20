@@ -28,7 +28,7 @@ placeholder = "<|image_pad|>"
 
 # 加载数据集
 print("Loading dataset from HuggingFace...")
-dataset_dict = load_dataset("zhhxte/mllm_cl_pathvqa")
+dataset_dict = load_dataset("xxxx/xxxx") # To comply with anonymity requirements, we will use the actual download link after the article is accepted.
 train_data = list(dataset_dict["train"])
 test_data = list(dataset_dict["test"])
 
