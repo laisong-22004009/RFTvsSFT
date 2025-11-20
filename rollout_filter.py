@@ -4,220 +4,311 @@ import random
 import re
 from PIL import Image as PILImage
 from tqdm import tqdm
-from multiprocessing import Process
 from vllm import LLM, SamplingParams
 from vllm.utils import random_uuid
-from datasets import Dataset, DatasetDict, Features, Value, Image
+from datasets import Dataset, load_dataset
 from mathruler.grader import grade_answer
-import sys
+from huggingface_hub import login
 import torch
 
-# ====== 配置 ======
-NUM_PROCESSES = 8
+# HuggingFace登录
+login(token="your_token")  # 替换为你的token
+
+# 配置
 BATCH_SIZE = 24
-SAMPLES_PER_ROUND = 8
-MAX_NUM_REPLIES = 1
-MAX_ROUNDS = 1
+SAMPLES_PER_ITEM = 8
 
-# 模型与路径设置
-model_path = "path/to/your/model" 
+model_path = "model_path"
+final_output_dir = "final_data_dir"
 
-json_path = "path/to/your/data" 
-image_root = "path/to/your/images" 
-
-final_output_dir_pass = "path/to/your/output"  # 替换为实际输出路径
-temp_output_dir = "path/to/temp/output"  # 替换为实际临时输出路径
-
-os.makedirs(temp_output_dir, exist_ok=True)
+os.makedirs(final_output_dir, exist_ok=True)
 
 pattern = re.compile(r"<think>.*?</think>\s*\\boxed\{(.*?)\}", re.DOTALL)
 placeholder = "<|image_pad|>"
 
+# 加载数据集
+print("Loading dataset from HuggingFace...")
+dataset_dict = load_dataset("zhhxte/mllm_cl_pathvqa")
+train_data = list(dataset_dict["train"])
+test_data = list(dataset_dict["test"])
 
-with open(json_path, "r") as f:
-    data = json.load(f)
+print(f"\nOriginal dataset: {len(train_data)} train, {len(test_data)} test")
 
-chunk_size = len(data) // NUM_PROCESSES
-chunks = [data[i * chunk_size:(i + 1) * chunk_size] for i in range(NUM_PROCESSES)]
-if len(data) % NUM_PROCESSES:
-    chunks[-1].extend(data[NUM_PROCESSES * chunk_size:])
+# 为训练集添加索引
+for idx, item in enumerate(train_data):
+    item['global_index'] = idx
 
-# 预加载图片
-all_image_paths = {os.path.join(image_root, img) for item in data for img in item.get("images", [])}
-image_cache = {}
-for path in tqdm(all_image_paths, desc="预加载图片"):
-    try:
-        image_cache[path] = PILImage.open(path).convert("RGB")
-    except:
-        image_cache[path] = None
-
-# ====== 子进程函数 ======
-def worker_fn(idx, data_chunk, gpu_id):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    # make sure to set enough max_model_len if needed !!
-    # llm = LLM(model=model_path, tensor_parallel_size=1, gpu_memory_utilization=0.96, max_model_len=8192)
-    llm = LLM(model=model_path, tensor_parallel_size=1, gpu_memory_utilization=0.85)
-    results = []
-    skipped_items = []
-
-    def build_batch(data_slice):
-        batch, meta = [], []
-        for item in data_slice:
-            messages = item.get("messages", [])
-            user_msg = next((m["content"] for m in messages if m["role"] == "user"), None)
-            if not user_msg:
-                meta.append(None)
-                continue
-            gt = messages[-1]["content"].strip()
-            answer_msg = f"The answer of this question is {gt}"
-            user_msg = user_msg + '\n' + answer_msg + " You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \\boxed{}."
-            limit_msg=f"1. Give out coresponding reasoning process and final answer in the format of <think> </think> and \\boxed{{}}. \n2. Your reasoning should be as natural, detailed, and logical as normal problem solving. Do not rely on or refer to the standard answer, which is only used as a reference for you to check the correctness of your reasoning.\n3. The final answer must be accurate and consistent with the standard answer, but do not make the reader feel that you know the answer in advance."
-            user_msg = user_msg + "\n\n" + limit_msg
-
-            image_paths = item.get("images", [])
-            if not image_paths:
-                meta.append(None)
-                continue
-
-            image_path = os.path.join(image_root, image_paths[0])
-            image = image_cache.get(image_path, None)
-            if image is None or image.height < 28 or image.width < 28:
-                meta.append(None)
-                continue
-
-            label = next((m["content"] for m in messages if m["role"] == "assistant"), None)
-            user_content = user_msg.replace("<image>", f"<|vision_start|>{placeholder}<|vision_end|>")
-            prompt = (
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-            batch.append({
-                "prompt": prompt,
-                "multi_modal_data": {"image": image},
-                "request_id": random_uuid(),
-            })
-            meta.append({
-                "user_msg": user_msg,
-                "label": label,
-                "image_paths": image_paths,
-                "item": item
-            })
-        return batch, meta
-
-    #for start in range(0, len(data_chunk), BATCH_SIZE):
-    if idx == 0:
-        loop_iter = tqdm(
-            range(0, len(data_chunk), BATCH_SIZE),
-            desc=f"[GPU {gpu_id}] Worker {idx}",
-            dynamic_ncols=True
-        )
-    else:
-        loop_iter = range(0, len(data_chunk), BATCH_SIZE)
-
-    for start in loop_iter:
-        data_slice = data_chunk[start:start + BATCH_SIZE]
-        collected_list = [[] for _ in data_slice]
-        meta_list = [None for _ in data_slice]
-
-        for round_idx in range(MAX_ROUNDS):
-            indices = [i for i, r in enumerate(collected_list) if len(r) < MAX_NUM_REPLIES]
-            if not indices:
-                break
-            sub_slice = [data_slice[i] for i in indices]
-            batch, meta = build_batch(sub_slice)
-            if not batch:
-                continue
-            params = SamplingParams(temperature=1.0, n=SAMPLES_PER_ROUND * (2 ** round_idx), max_tokens=1024)
-            outputs = llm.generate(batch, params)
-
-            for j, out_group in enumerate(outputs):
-                i = indices[j]
-                info = meta[j]
-                if info is None:
-                    continue
-                for out in out_group.outputs:
-                    if len(collected_list[i]) >= MAX_NUM_REPLIES:
-                        break
-                    reply = out.text.strip()
-                    match = pattern.search(reply)
-                    if not match:
-                        continue
-                    answer = match.group(1).strip()
-                    # 检查答案是否正确
-                    is_correct = False
-                    if info["label"]:
-                        is_correct = grade_answer(answer, info["label"].strip())
-                    
-                    # 只有答案正确时才添加到结果中
-                    if is_correct:
-                        collected_list[i].append({
-                            "messages": [
-                                {"role": "user", "content": info["user_msg"]},
-                                {"role": "assistant", "content": reply}
-                            ],
-                            "images": info["image_paths"]
-                        })
-                meta_list[i] = info
-
-        # 只保存有正确答案的数据项
-        for i, replies in enumerate(collected_list):
-            if replies:  # 只有当这个数据项有至少一个正确回答时才保存
-                results.extend(replies)
-            else:
-                skipped_items.append(data_slice[i])
-
-    with open(os.path.join(temp_output_dir, f"results_{idx}.json"), "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    with open(os.path.join(temp_output_dir, f"skipped_{idx}.json"), "w") as f:
-        json.dump(skipped_items, f, indent=2, ensure_ascii=False)
+def build_batch_item(item):
+    problem = item.get("problem", "")
+    if not problem:
+        return None, None
     
-    del llm
-    torch.cuda.empty_cache()
-
-# ====== 主控制函数 ======
-def process_for_parquet(vqa_data):
-    images, problems, answers = [], [], []
-    for example in vqa_data:
-        problems.append(example["messages"][0]["content"])
-        answers.append(example["messages"][1]["content"])
-        if "images" in example:
-            img_path = example["images"][0]
-            if img_path in image_cache:
-                images.append(image_cache.get(img_path, None))
-            else:
-                img_path = os.path.join(image_root, example["images"][0])
-                images.append(image_cache.get(img_path, None))
-        else:
-            images.append(None)
-    return {"images": images, "problem": problems, "answer": answers}
+    answer = item.get("answer", "").strip()
+    images = item.get("images", None)
+    
+    if images is None or len(images) == 0:
+        return None, None
+    
+    image = images[0]
+    
+    if not isinstance(image, PILImage.Image):
+        return None, None
+    
+    if image.height < 28 or image.width < 28:
+        return None, None
+    
+    user_msg = f"{problem}\nYou FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \\boxed{{}}."
+    
+    user_content = user_msg.replace("<image>", f"<|vision_start|>{placeholder}<|vision_end|>")
+    prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    
+    return {
+        "prompt": prompt,
+        "multi_modal_data": {"image": image},
+        "request_id": random_uuid(),
+    }, {
+        "problem": problem,
+        "answer": answer,
+        "global_index": item.get('global_index')
+    }
 
 def main():
-    processes = []
-    for i in range(NUM_PROCESSES):
-        p = Process(target=worker_fn, args=(i, chunks[i], i))  # 每个进程绑到第 i 张 GPU
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
-        print(f"Process {p.pid} exit code: {p.exitcode}")
-        
-    print("✅ 所有子进程已 join，开始合并结果...", flush=True)
-    all_results, all_skipped = [], []
-    for i in range(NUM_PROCESSES):
-        with open(os.path.join(temp_output_dir, f"results_{i}.json")) as f:
-            all_results += json.load(f)
-        with open(os.path.join(temp_output_dir, f"skipped_{i}.json")) as f:
-            all_skipped += json.load(f)
+    # 创建单个模型实例
+    print("Loading model...")
+    llm = LLM(model=model_path, tensor_parallel_size=1, gpu_memory_utilization=0.7)
     
-    print(f"✅ 合并完成，共 {len(all_results)} 条通过（能做对的数据），{len(all_skipped)} 条跳过（一次都做不对的数据）")
-    print("✅ 所有结果合并完毕，开始写入过滤后的数据集", flush=True)
-    with open(final_output_dir_pass, "w") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
-    print(f"✅ 过滤后的数据集已保存到: {final_output_dir_pass}", flush=True)
-    print(f"✅ 跳过的数据项保存在: {temp_output_dir}/skipped_*.json", flush=True)
+    results = []
+    
+    # 批处理所有训练数据
+    print("Processing training data...")
+    for start in tqdm(range(0, len(train_data), BATCH_SIZE), desc="Processing batches"):
+        data_slice = train_data[start:start + BATCH_SIZE]
+        batch, meta_list = [], []
+        
+        for item in data_slice:
+            batch_item, meta = build_batch_item(item)
+            if batch_item is None:
+                results.append({
+                    "global_index": item.get('global_index'),
+                    "problem": item.get("problem", ""),
+                    "answer": item.get("answer", ""),
+                    "correct_count": 0,
+                    "total_count": 0,
+                    "responses": []
+                })
+            else:
+                batch.append(batch_item)
+                meta_list.append(meta)
+        
+        if not batch:
+            continue
+        
+        # 推理
+        params = SamplingParams(temperature=1.0, n=SAMPLES_PER_ITEM, max_tokens=1024)
+        outputs = llm.generate(batch, params)
+        
+        # 处理结果
+        for j, out_group in enumerate(outputs):
+            meta = meta_list[j]
+            correct_count = 0
+            responses = []
+            
+            for out in out_group.outputs:
+                reply = out.text.strip()
+                match = pattern.search(reply)
+                
+                if match:
+                    answer = match.group(1).strip()
+                    is_correct = grade_answer(answer, meta["answer"])
+                    if is_correct:
+                        correct_count += 1
+                    
+                    responses.append({
+                        "response": reply,
+                        "extracted_answer": answer,
+                        "is_correct": is_correct
+                    })
+                else:
+                    responses.append({
+                        "response": reply,
+                        "extracted_answer": None,
+                        "is_correct": False
+                    })
+            
+            results.append({
+                "global_index": meta["global_index"],
+                "problem": meta["problem"],
+                "answer": meta["answer"],
+                "correct_count": correct_count,
+                "total_count": SAMPLES_PER_ITEM,
+                "responses": responses
+            })
+    
+    # 清理模型
+    del llm
+    torch.cuda.empty_cache()
+    
+    print(f"\nTotal processed items: {len(results)}")
+    
+    # 分组：solvable (1-8/8) vs unsolvable (0/8)
+    solvable = []
+    unsolvable = []
+    
+    for item in results:
+        correct_count = item["correct_count"]
+        total_count = item["total_count"]
+        
+        if total_count == 0 or correct_count == 0:
+            unsolvable.append(item)
+        else:
+            solvable.append(item)
+    
+    print(f"\nSolvable (1-8/8 correct): {len(solvable)}")
+    print(f"Unsolvable (0/8 correct): {len(unsolvable)}")
+    
+    # 计算max_sample
+    max_sample = min(len(solvable), len(unsolvable), 7500)
+    print(f"\nMax sample size: {max_sample}")
+    
+    # 随机采样
+    random.seed(42)
+    solvable_sampled = random.sample(solvable, max_sample)
+    unsolvable_sampled = random.sample(unsolvable, max_sample)
+    
+    print(f"Sampled solvable: {len(solvable_sampled)}")
+    print(f"Sampled unsolvable: {len(unsolvable_sampled)}")
+    
+    # 转换为Dataset
+    def convert_to_dataset(items, original_data):
+        if not items:
+            return None
+        
+        data_dict = {
+            "images": [],
+            "problem": [],
+            "answer": [],
+            "correct_count": [],
+            "total_count": [],
+            "responses": []
+        }
+        
+        for item in items:
+            global_idx = item.get("global_index")
+            if global_idx is not None and global_idx < len(original_data):
+                images = original_data[global_idx].get("images")
+                image = images[0] if images and len(images) > 0 else None
+            else:
+                image = None
+            
+            data_dict["images"].append([image] if image is not None else [])
+            data_dict["problem"].append(item.get("problem", ""))
+            data_dict["answer"].append(item.get("answer", ""))
+            data_dict["correct_count"].append(item["correct_count"])
+            data_dict["total_count"].append(item["total_count"])
+            data_dict["responses"].append(json.dumps(item["responses"], ensure_ascii=False))
+        
+        return Dataset.from_dict(data_dict)
+    
+    # 准备test集
+    def prepare_test_dataset(test_data):
+        data_dict = {
+            "images": [],
+            "problem": [],
+            "answer": [],
+            "correct_count": [],
+            "total_count": [],
+            "responses": []
+        }
+        
+        for item in test_data:
+            images = item.get("images")
+            image = images[0] if images and len(images) > 0 else None
+            
+            data_dict["images"].append([image] if image is not None else [])
+            data_dict["problem"].append(item.get("problem", ""))
+            data_dict["answer"].append(item.get("answer", ""))
+            data_dict["correct_count"].append(-1)  # 标记为未推理
+            data_dict["total_count"].append(-1)
+            data_dict["responses"].append("[]")
+        
+        return Dataset.from_dict(data_dict)
+    
+    # 准备random数据集
+    def prepare_random_dataset(train_data, max_sample):
+        random.seed(42)
+        sampled_data = random.sample(train_data, min(max_sample, len(train_data)))
+        
+        data_dict = {
+            "images": [],
+            "problem": [],
+            "answer": [],
+            "correct_count": [],
+            "total_count": [],
+            "responses": []
+        }
+        
+        for item in sampled_data:
+            images = item.get("images")
+            image = images[0] if images and len(images) > 0 else None
+            
+            data_dict["images"].append([image] if image is not None else [])
+            data_dict["problem"].append(item.get("problem", ""))
+            data_dict["answer"].append(item.get("answer", ""))
+            data_dict["correct_count"].append(-1)  # 标记为未推理
+            data_dict["total_count"].append(-1)
+            data_dict["responses"].append("[]")
+        
+        return Dataset.from_dict(data_dict)
+    
+    test_dataset = prepare_test_dataset(test_data)
+    print(f"\nTest set: {len(test_dataset)} samples")
+    
+    # 准备random训练集
+    random_train_dataset = prepare_random_dataset(train_data, max_sample)
+    print(f"Random train set: {len(random_train_dataset)} samples")
+    
+    # 保存三个数据集到本地
+    datasets_to_save = [
+        ("mllm_cl_pathvqa_solvable", solvable_sampled),
+        ("mllm_cl_pathvqa_unsolvable", unsolvable_sampled),
+        ("mllm_cl_pathvqa_random", None)
+    ]
+    
+    for dataset_name, train_items in datasets_to_save:
+        save_path = os.path.join(final_output_dir, dataset_name)
+        os.makedirs(save_path, exist_ok=True)
+        
+        print(f"\nSaving to {save_path}...")
+        
+        if dataset_name == "mllm_cl_pathvqa_random":
+            print(f"  Train: {len(random_train_dataset)} samples")
+            print(f"  Test: {len(test_dataset)} samples")
+            
+            random_train_dataset.to_parquet(os.path.join(save_path, "train.parquet"))
+            test_dataset.to_parquet(os.path.join(save_path, "test.parquet"))
+        else:
+            if train_items:
+                train_ds = convert_to_dataset(train_items, train_data)
+                if train_ds:
+                    print(f"  Train: {len(train_ds)} samples")
+                    print(f"  Test: {len(test_dataset)} samples")
+                    
+                    train_ds.to_parquet(os.path.join(save_path, "train.parquet"))
+                    test_dataset.to_parquet(os.path.join(save_path, "test.parquet"))
+        
+        print(f"{dataset_name} saved successfully!")
+    
+    print("\nAll datasets saved to local directory!")
+    print(f"Location: {final_output_dir}")
+    print(f"\nSummary:")
+    print(f"  mllm_cl_pathvqa_solvable: {max_sample} train samples")
+    print(f"  mllm_cl_pathvqa_unsolvable: {max_sample} train samples")
+    print(f"  mllm_cl_pathvqa_random: {min(max_sample, len(train_data))} train samples")
+    print(f"  All datasets share the same test set: {len(test_dataset)} samples")
 
 if __name__ == "__main__":
     main()
-
